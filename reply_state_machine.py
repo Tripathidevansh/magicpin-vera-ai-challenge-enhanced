@@ -44,8 +44,16 @@ OPT_OUT_PATTERNS = [
     r"\bleave\s+me\s+alone\b",
     r"\bopt\s*-?\s*out\b",
     r"^\s*stop[\s\.!]*$",
+    # Hindi-English code-mix (Hinglish) & polite opt-out / hostility
+    r"\b(?:ab\s+)?stop\s+karo\b",
     r"\bband\s+karo\b",
     r"\bmessage\s+mat\s+karo\b",
+    r"\bmat\s+bhejo\b",
+    r"\bbahut\s+ho\s+gaya\b",
+    r"\bnahi\s+chahiye\b",
+    r"\bplease\s+stop\b",
+    r"\bstop\s+please\b",
+    r"\bkhatam\s+karo\b",
 ]
 OPT_OUT_RE = re.compile("|".join(OPT_OUT_PATTERNS), re.IGNORECASE)
 
@@ -75,8 +83,21 @@ COMMITMENT_PATTERNS = [
 ]
 COMMITMENT_RE = re.compile("|".join(COMMITMENT_PATTERNS), re.IGNORECASE)
 
+DEFERRAL_PATTERNS = [
+    r"\bnot\s+(?:right\s+)?now\b",
+    r"\b(?:maybe\s+)?later\b",
+    r"\bsome\s+other\s+time\b",
+    r"\bbaad\s+mein\b",
+    r"\bnot\s+today\b",
+]
+DEFERRAL_RE = re.compile("|".join(DEFERRAL_PATTERNS), re.IGNORECASE)
+
 NEGATION_PATTERNS = [
-    r"\bnot\s+(?:ok|sure|good|interested|ready|now)\b",
+    r"\bnot\s+(?:ok|sure|good|interested|ready|now|today|yet)\b",
+    r"\bnot\s+right\s+now\b",
+    r"\b(?:maybe\s+)?later\b",
+    r"\bsome\s+other\s+time\b",
+    r"\bbaad\s+mein\b",
     r"^\s*no[\s\.!]*$",
 ]
 NEGATION_RE = re.compile("|".join(NEGATION_PATTERNS), re.IGNORECASE)
@@ -96,14 +117,21 @@ def is_auto_reply(message: str) -> bool:
     return bool(AUTO_REPLY_RE.search(message))
 
 
+def is_deferral(message: str) -> bool:
+    """Deterministic detection of merchant postponing / asking for time."""
+    if not message or not message.strip():
+        return False
+    return bool(DEFERRAL_RE.search(message))
+
+
 def is_commitment(message: str) -> bool:
     """Deterministic detection of agreement, commitment, or next-step inquiry."""
     if not message or not message.strip():
         return False
-    # If it is an opt out or negation, commitment must not match
+    # If it is an opt out, hostile, negation, or deferral, commitment must not match
     if is_opt_out_or_hostile(message):
         return False
-    if NEGATION_RE.search(message):
+    if NEGATION_RE.search(message) or is_deferral(message):
         return False
     return bool(COMMITMENT_RE.search(message))
 
@@ -179,7 +207,17 @@ class ReplyStateMachine:
                     "rationale": f"Consecutive auto-reply loop detected (threshold={cls.AUTO_REPLY_THRESHOLD} reached). Closing conversation.",
                 }
 
-        # 4. Check Commitment / Intent Transition
+        # 4. Check Deferral / Merchant Asked for Time
+        if is_deferral(message):
+            await state.reset_auto_reply(merchant_id, conversation_id)
+            await state.set_conversation_state(conversation_id, ConversationState.WAITING)
+            return {
+                "action": "wait",
+                "wait_seconds": 14400,
+                "rationale": "Merchant deferred or asked for time ('not right now / later'). Backing off to give merchant time.",
+            }
+
+        # 5. Check Commitment / Intent Transition
         if is_commitment(message):
             await state.reset_auto_reply(merchant_id, conversation_id)
             await state.set_conversation_state(conversation_id, ConversationState.COMMITTED)

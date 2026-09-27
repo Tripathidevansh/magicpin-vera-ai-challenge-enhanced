@@ -144,6 +144,8 @@ class ThreadSafeState:
         self._opted_out_merchants: Set[str] = set()
         self._merchant_auto_replies: Dict[str, int] = {}
         self._conv_auto_replies: Dict[str, int] = {}
+        self._reserved_merchants: Set[str] = set()
+        self._reserved_suppressions: Set[str] = set()
 
     def get_context_counts(self) -> Dict[str, int]:
         """Fast non-blocking read for /v1/healthz probe."""
@@ -198,12 +200,18 @@ class ThreadSafeState:
         now_dt: Optional[datetime] = None,
         merchant_id: Optional[str] = None,
     ) -> bool:
-        """Check if a suppression key is currently active for a merchant or globally."""
+        """Check if a suppression key is currently active for a merchant or globally, or currently reserved."""
         async with self._lock:
+            scoped_key = f"{merchant_id}:{key}" if merchant_id else None
+            # Check reservation (strictly merchant-scoped when merchant_id provided)
+            if scoped_key and scoped_key in self._reserved_suppressions:
+                return True
+            if not merchant_id and key in self._reserved_suppressions:
+                return True
+
             rec = None
             matched_key = None
             if merchant_id:
-                scoped_key = f"{merchant_id}:{key}"
                 if scoped_key in self._suppressions:
                     rec = self._suppressions[scoped_key]
                     matched_key = scoped_key
@@ -256,8 +264,10 @@ class ThreadSafeState:
             self._opted_out_merchants.add(merchant_id)
 
     async def is_merchant_in_cooldown(self, merchant_id: str, now_dt: datetime) -> bool:
-        """Check if merchant received a proactive outreach in the last simulated 24h."""
+        """Check if merchant received a proactive outreach in the last simulated 24h or is currently reserved."""
         async with self._lock:
+            if merchant_id in self._reserved_merchants:
+                return True
             rec = self._cooldowns.get(merchant_id)
             if not rec:
                 return False
@@ -265,6 +275,59 @@ class ThreadSafeState:
             if last_sent_dt and (now_dt - last_sent_dt).total_seconds() < 86400:
                 return True
             return False
+
+    async def reserve_candidate(
+        self,
+        merchant_id: str,
+        suppression_key: Optional[str] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Atomically reserve a merchant and suppression key for proactive outreach.
+        Guarantees that concurrent ticks cannot select the same merchant or trigger,
+        while maintaining strict merchant-scoped isolation for shared suppression keys.
+        """
+        async with self._lock:
+            # 1. Check merchant cooldown or active reservation
+            if merchant_id in self._reserved_merchants:
+                return False
+            rec = self._cooldowns.get(merchant_id)
+            if rec and now_dt:
+                last_sent_dt = parse_iso_utc(rec.last_sent_at_iso)
+                if last_sent_dt and (now_dt - last_sent_dt).total_seconds() < 86400:
+                    return False
+
+            # 2. Check suppression key (strictly merchant-scoped)
+            scoped_supp = f"{merchant_id}:{suppression_key}" if suppression_key else None
+            if scoped_supp:
+                if scoped_supp in self._reserved_suppressions:
+                    return False
+
+                supp_rec = self._suppressions.get(scoped_supp) or self._suppressions.get(suppression_key)
+                if supp_rec:
+                    if not supp_rec.expires_at_iso or not now_dt:
+                        return False
+                    exp_dt = parse_iso_utc(supp_rec.expires_at_iso)
+                    if exp_dt and now_dt < exp_dt:
+                        return False
+
+            # 3. Claim reservation
+            self._reserved_merchants.add(merchant_id)
+            if scoped_supp:
+                self._reserved_suppressions.add(scoped_supp)
+            return True
+
+    async def release_reservation(
+        self,
+        merchant_id: str,
+        suppression_key: Optional[str] = None,
+    ) -> None:
+        """Release reservation if composition fails or is aborted."""
+        async with self._lock:
+            self._reserved_merchants.discard(merchant_id)
+            if suppression_key:
+                scoped_supp = f"{merchant_id}:{suppression_key}"
+                self._reserved_suppressions.discard(scoped_supp)
 
     async def commit_action(self, action: Dict[str, Any], now_dt: datetime) -> None:
         """Atomically persist suppression key, merchant cooldown, and conversation state."""
@@ -316,6 +379,12 @@ class ThreadSafeState:
                     ],
                 )
                 self._conversations[conv_id] = conv
+
+            # 4. Clear reservations now that permanent records are established
+            if mid:
+                self._reserved_merchants.discard(mid)
+            if supp_key and mid:
+                self._reserved_suppressions.discard(f"{mid}:{supp_key}")
 
     async def get_conversation(self, conversation_id: str) -> Optional[ConversationRecord]:
         async with self._lock:
@@ -445,13 +514,36 @@ async def metadata():
 
 
 @app.post("/v1/context")
-async def push_context(body: ContextPushRequest):
+async def push_context(request: Request, body: ContextPushRequest):
     """
     Atomic context ingestion endpoint.
+    - Enforces 500 KB payload size cap (challenge rate limits & operational constraints)
     - Validates scope
     - Enforces idempotency and version bump rules
     - Returns HTTP 409 Conflict if version <= current version
     """
+    # 500 KB payload cap enforcement per Challenge Testing Brief Section 5
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > 500 * 1024:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "accepted": False,
+                "reason": "payload_too_large",
+                "details": f"Context payload size ({content_length} bytes) exceeds 500 KB cap.",
+            },
+        )
+    raw_body = await request.body()
+    if len(raw_body) > 500 * 1024:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "accepted": False,
+                "reason": "payload_too_large",
+                "details": f"Context payload size ({len(raw_body)} bytes) exceeds 500 KB cap.",
+            },
+        )
+
     if body.scope not in VALID_SCOPES:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,

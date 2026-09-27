@@ -12,6 +12,7 @@ Zero LLM calls. Zero hallucinations. Strictly grounded in stored context.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -84,6 +85,45 @@ class GroundingValidator:
         r"completely\s*(?:cure|safe)|zero\s*risk|instant\s*cure|painless\s*guaranteed|cheap\s*drugs)\b",
         re.IGNORECASE,
     )
+    DATE_EXPLICIT_PATTERN = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
+    DATE_VERBAL_PATTERN = re.compile(
+        r"\b(?:(\d{1,2})(?:st|nd|rd|th)?\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)|"
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?)\b",
+        re.IGNORECASE,
+    )
+    UNSUPPORTED_COMMITMENT_PATTERN = re.compile(
+        r"\b(?:guaranteed?|promise[sd]?|100%|instant)\s+"
+        r"(?:delivery|booking|appointment|turnaround|refund|cashback|results?|recovery|response|dispatch|arrival)\b|"
+        r"\b(?:delivery|booking|appointment|turnaround|refund|cashback|results?|recovery|dispatch)\s+guaranteed?\b",
+        re.IGNORECASE,
+    )
+    UNSUPPORTED_DELIVERY_PATTERN = re.compile(
+        r"\b(?:free\s+(?:home\s+)?delivery|doorstep\s+delivery|same[- ]day\s+delivery|express\s+delivery)\b",
+        re.IGNORECASE,
+    )
+    UNSUPPORTED_BOOKING_PATTERN = re.compile(
+        r"\b(?:instant\s+booking|booking\s+confirmed|table\s+reserved|slot\s+confirmed|guaranteed\s+slot)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_price_key(cls, key: str) -> bool:
+        """Determines whether a dictionary key genuinely represents a monetary price/fee/cost."""
+        k_low = key.lower()
+        price_cues = (
+            "price", "amount", "fee", "cost", "renewal", "spend",
+            "ticket", "mrp", "min_order", "threshold", "bill", "budget", "offer"
+        )
+        non_price_cues = (
+            "day", "hour", "week", "month", "year", "window",
+            "urgency", "trial", "count", "metric", "view", "call",
+            "inquir", "delta", "pct", "percent", "version", "id",
+            "turn", "number", "score", "rank", "milestone", "occurrence",
+            "credit", "visit", "baseline", "distance", "batch", "code", "n_"
+        )
+        has_price = any(c in k_low for c in price_cues)
+        has_non_price = any(c in k_low for c in non_price_cues)
+        return has_price and not has_non_price
 
     @classmethod
     def _collect_allowed_prices(
@@ -120,22 +160,235 @@ class GroundingValidator:
                 if val.isdigit():
                     prices.add(int(val))
 
-        # 3. From Trigger Payload
+        # 3. From Trigger Payload (strictly genuinely price-bearing keys only)
         payload = trigger.get("payload", {})
         if isinstance(payload, dict):
             for k, v in payload.items():
-                if isinstance(v, (int, float)) and v > 0:
-                    prices.add(int(v))
-                elif isinstance(v, str):
-                    extract_numbers_from_str(v)
+                if cls._is_price_key(k):
+                    if isinstance(v, (int, float)) and v > 0:
+                        prices.add(int(v))
+                    elif isinstance(v, str):
+                        clean_str = v.replace(",", "").strip()
+                        if clean_str.isdigit():
+                            prices.add(int(clean_str))
+                        extract_numbers_from_str(v)
+
+        # 4. From Customer Context (strictly genuinely price-bearing keys only)
+        if customer and isinstance(customer, dict):
+            for k, v in customer.items():
+                if cls._is_price_key(k):
+                    if isinstance(v, (int, float)) and v > 0:
+                        prices.add(int(v))
+                    elif isinstance(v, str):
+                        clean_str = v.replace(",", "").strip()
+                        if clean_str.isdigit():
+                            prices.add(int(clean_str))
+                        extract_numbers_from_str(v)
+
+        return prices
+
+    @classmethod
+    def _collect_verified_dates(
+        cls,
+        category: Dict[str, Any],
+        merchant: Dict[str, Any],
+        trigger: Dict[str, Any],
+        customer: Optional[Dict[str, Any]] = None,
+    ) -> Set[str]:
+        """Collect verified dates from genuine date-bearing fields only."""
+        allowed: Set[str] = set()
+        month_abbrs = ["", "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        month_fulls = [
+            "", "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december"
+        ]
+
+        def add_iso_and_variants(iso_val: Any):
+            if not isinstance(iso_val, str) or not iso_val.strip():
+                return
+            m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", iso_val)
+            if not m:
+                return
+            iso_date = m.group(0)
+            allowed.add(iso_date)
+            try:
+                m_int = int(m.group(2))
+                d_int = int(m.group(3))
+                if 1 <= m_int <= 12 and 1 <= d_int <= 31:
+                    m_abbr = month_abbrs[m_int]
+                    m_full = month_fulls[m_int]
+                    allowed.add(f"{d_int} {m_abbr}")
+                    allowed.add(f"{m_abbr} {d_int}")
+                    allowed.add(f"{d_int} {m_full}")
+                    allowed.add(f"{m_full} {d_int}")
+                    allowed.add(f"{d_int:02d}/{m_int:02d}")
+                    allowed.add(f"{m_int:02d}/{d_int:02d}")
+                    allowed.add(f"{d_int:02d}/{m_int:02d}/{m.group(1)}")
+                    allowed.add(f"{m_int:02d}/{d_int:02d}/{m.group(1)}")
+            except Exception:
+                pass
+
+        def add_label_variants(label_val: Any):
+            if not isinstance(label_val, str) or not label_val.strip():
+                return
+            allowed.add(label_val.lower())
+            for vm in cls.DATE_VERBAL_PATTERN.finditer(label_val):
+                allowed.add(vm.group(0).lower())
+                d = vm.group(1) or vm.group(4)
+                mon = vm.group(2) or vm.group(3)
+                if d and mon:
+                    mon_clean = mon[:3].lower()
+                    allowed.add(f"{int(d)} {mon_clean}")
+                    allowed.add(f"{mon_clean} {int(d)}")
+
+        # 1. Available slots & session options in trigger payload
+        payload = trigger.get("payload", {})
+        if isinstance(payload, dict):
+            for slot_key in ("available_slots", "next_session_options", "slots"):
+                slots_list = payload.get(slot_key, [])
+                if isinstance(slots_list, list):
+                    for slot in slots_list:
+                        if isinstance(slot, dict):
+                            add_iso_and_variants(slot.get("iso", ""))
+                            add_label_variants(slot.get("label", ""))
+
+            # Explicit verified date keys in payload
+            DATE_KEYS = (
+                "date", "deadline_iso", "due_date", "wedding_date", "trial_date",
+                "match_time_iso", "last_service_date", "last_refill", "stock_runs_out_iso",
+                "opened_date", "event_date", "valid_until", "expires_at"
+            )
+            for dk in DATE_KEYS:
+                val = payload.get(dk)
+                if isinstance(val, str):
+                    add_iso_and_variants(val)
+                    add_label_variants(val)
+
+        # 2. Trigger expires_at
+        add_iso_and_variants(trigger.get("expires_at", ""))
+
+        # 3. Verified dates from merchant offers
+        for off in merchant.get("offers", []):
+            if isinstance(off, dict):
+                add_iso_and_variants(off.get("started", ""))
+                add_iso_and_variants(off.get("ended", ""))
+
+        # 4. Verified dates from customer profile
+        if customer and isinstance(customer, dict):
+            for dk in ("last_visit_date", "wedding_date", "trial_completed", "due_date"):
+                val = customer.get(dk)
+                if isinstance(val, str):
+                    add_iso_and_variants(val)
+                    add_label_variants(val)
+
+        return allowed
+
+    @classmethod
+    def _has_verified_delivery_offering(
+        cls,
+        category: Dict[str, Any],
+        merchant: Dict[str, Any],
+        trigger: Dict[str, Any],
+        customer: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Check if delivery (especially free/doorstep/express) is an explicitly verified service/offer."""
+        # 1. From Merchant Offers
+        for off in merchant.get("offers", []):
+            if isinstance(off, dict) and off.get("status", "active") == "active":
+                title_low = off.get("title", "").lower()
+                val_low = str(off.get("value", "")).lower()
+                type_low = str(off.get("type", "")).lower()
+                if any(kw in title_low for kw in ("delivery", "doorstep", "shipping")):
+                    return True
+                if val_low == "free_delivery" or type_low == "free_delivery":
+                    return True
+
+        # 2. From Category Offer Catalog
+        for off in category.get("offer_catalog", []):
+            if isinstance(off, dict):
+                title_low = off.get("title", "").lower()
+                val_low = str(off.get("value", "")).lower()
+                type_low = str(off.get("type", "")).lower()
+                if any(kw in title_low for kw in ("delivery", "doorstep", "shipping")):
+                    return True
+                if val_low == "free_delivery" or type_low == "free_delivery":
+                    return True
+
+        # 3. From Trigger Payload explicit delivery enablement
+        payload = trigger.get("payload", {})
+        if isinstance(payload, dict):
+            if payload.get("delivery_address_saved") is True:
+                return True
+            if payload.get("delivery_enabled") is True or payload.get("has_delivery") is True:
+                return True
 
         # 4. From Customer Context
         if customer and isinstance(customer, dict):
-            for k, v in customer.items():
-                if isinstance(v, str):
-                    extract_numbers_from_str(v)
+            if customer.get("delivery_address_saved") is True:
+                return True
 
-        return prices
+        # 5. From Merchant Operational Features
+        if merchant.get("delivery_enabled") is True or merchant.get("has_delivery") is True:
+            return True
+
+        return False
+
+    @classmethod
+    def _has_verified_booking_context(
+        cls,
+        category: Dict[str, Any],
+        merchant: Dict[str, Any],
+        trigger: Dict[str, Any],
+        customer: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Verify whether explicit appointment/slot/booking capability exists in verified context."""
+        payload = trigger.get("payload", {})
+        if isinstance(payload, dict):
+            for k in ("available_slots", "next_session_options", "slots"):
+                slots_list = payload.get(k)
+                if slots_list and isinstance(slots_list, list) and len(slots_list) > 0:
+                    return True
+            if payload.get("service_due") or payload.get("next_step_window_open") or payload.get("trial_completed"):
+                return True
+            if payload.get("booking_enabled") is True:
+                return True
+
+        if trigger.get("kind") in ("recall_due", "trial_followup", "wedding_package_followup", "bridal_followup", "customer_lapsed_hard"):
+            return True
+
+        return False
+
+    @classmethod
+    def _is_verified_operational_commitment(
+        cls,
+        phrase: str,
+        category: Dict[str, Any],
+        merchant: Dict[str, Any],
+        trigger: Dict[str, Any],
+    ) -> bool:
+        """Verify whether an operational guarantee/promise is explicitly backed by a verified offer or policy."""
+        p_low = phrase.lower()
+        # 1. From Merchant Offers
+        for off in merchant.get("offers", []):
+            if isinstance(off, dict) and off.get("status", "active") == "active":
+                if p_low in off.get("title", "").lower() or p_low in off.get("description", "").lower():
+                    return True
+
+        # 2. From Category Offer Catalog
+        for off in category.get("offer_catalog", []):
+            if isinstance(off, dict):
+                if p_low in off.get("title", "").lower() or p_low in off.get("description", "").lower():
+                    return True
+
+        # 3. Explicit verified policy or guarantee fields
+        for source in (merchant, trigger.get("payload", {})):
+            if isinstance(source, dict):
+                for k in ("guarantee", "policy", "service_commitment", "sla"):
+                    val = str(source.get(k, "")).lower()
+                    if p_low in val:
+                        return True
+
+        return False
 
     @classmethod
     def _collect_allowed_percentages(
@@ -223,7 +476,7 @@ class GroundingValidator:
 
         # 4. Strict Medical & Regulatory Claim Validation for High-Risk Verticals
         cat_slug = category.get("slug", "")
-        if cat_slug in ("dentists", "pharmacy"):
+        if cat_slug in ("dentists", "pharmacy", "pharmacies"):
             med_match = cls.MEDICAL_TABOO_PATTERN.search(body)
             if med_match:
                 return False, f"contains_medical_claim: '{med_match.group(0)}'"
@@ -278,6 +531,45 @@ class GroundingValidator:
             has_choice_cue = bool(re.search(r"\b(or|slot|either|option)\b", body, re.IGNORECASE))
             if not has_choice_cue:
                 return False, "cta_mismatch_multi_choice: message missing choice/slot indicator ('or', 'slot')"
+
+        # 8. Provenance-Oriented Grounding for Factual Claims (Dates, Commitments, Delivery, Booking)
+
+        # 8a. Check explicit calendar dates against verified date fields only
+        verified_dates = cls._collect_verified_dates(category, merchant, trigger, customer)
+
+        for m in cls.DATE_EXPLICIT_PATTERN.finditer(body):
+            d_str = m.group(1)
+            if d_str not in verified_dates:
+                return False, f"unsupported_date: '{d_str}'"
+
+        for m in cls.DATE_VERBAL_PATTERN.finditer(body):
+            d = m.group(1) or m.group(4)
+            mon = m.group(2) or m.group(3)
+            if d and mon:
+                norm_key = f"{int(d)} {mon[:3].lower()}"
+                norm_rev = f"{mon[:3].lower()} {int(d)}"
+                matched_str = m.group(0).lower()
+                if (
+                    norm_key not in verified_dates
+                    and norm_rev not in verified_dates
+                    and matched_str not in verified_dates
+                ):
+                    return False, f"unsupported_date: '{m.group(0)}'"
+
+        # 8b. Unsupported operational commitments / claims (verified offer or policy required)
+        for m in cls.UNSUPPORTED_COMMITMENT_PATTERN.finditer(body):
+            if not cls._is_verified_operational_commitment(m.group(0), category, merchant, trigger):
+                return False, f"unsupported_operational_commitment: '{m.group(0)}'"
+
+        # 8c. Unsupported delivery claims (verified delivery offering required)
+        for m in cls.UNSUPPORTED_DELIVERY_PATTERN.finditer(body):
+            if not cls._has_verified_delivery_offering(category, merchant, trigger, customer):
+                return False, f"unsupported_delivery_claim: '{m.group(0)}'"
+
+        # 8d. Unsupported booking claims (verified booking/slot context required)
+        for m in cls.UNSUPPORTED_BOOKING_PATTERN.finditer(body):
+            if not cls._has_verified_booking_context(category, merchant, trigger, customer):
+                return False, f"unsupported_booking_claim: '{m.group(0)}'"
 
         return True, "valid"
 
@@ -459,6 +751,24 @@ class DeterministicComposer:
             template_name = "vera_perf_dip_reframe_v1"
             template_params = [salutation, metric, str(delta_pct)]
             rationale = "Performance dip reframe with seasonal benchmark and retention proposal."
+
+        # 8. Performance Spike / Growth Momentum
+        elif kind == "perf_spike":
+            metric = payload.get("metric", "views")
+            delta_val = payload.get("delta_pct")
+            if delta_val is None:
+                delta_val = mer.get("performance", {}).get(f"{metric}_delta_pct", 0.0)
+            delta_pct = abs(int(round(delta_val * 100))) if abs(delta_val) <= 1.0 else abs(int(delta_val))
+            window = payload.get("window", "week")
+
+            body = (
+                f"{salutation}, your {metric} are up {delta_pct}% this {window} on magicpin. "
+                f"Want me to draft a spotlight update to keep this momentum going?"
+            )
+            cta = "binary_yes_no"
+            template_name = "vera_perf_spike_v1"
+            template_params = [salutation, metric, str(delta_pct)]
+            rationale = "Grounded performance spike celebration anchored in verified metric surge."
 
         # 8. Customer Lapsed Hard / Winback (e.g. Case Study 8)
         elif kind == "customer_lapsed_hard":
@@ -783,10 +1093,22 @@ class DecisionEngine:
         # Rank candidates
         ranked = self.rank_candidates(deduped, now_dt)
 
-        # Apply batch ceiling
-        top_candidates = ranked[: self.max_candidates]
+        # Apply batch ceiling and reserve candidates atomically
+        candidates_to_compose: List[CandidateTrigger] = []
+        for cand in ranked:
+            if len(candidates_to_compose) >= self.max_candidates:
+                break
+            if hasattr(state, "reserve_candidate"):
+                reserved = await state.reserve_candidate(
+                    cand.merchant_id,
+                    cand.suppression_key,
+                    now_dt,
+                )
+                if not reserved:
+                    continue
+            candidates_to_compose.append(cand)
 
-        # Compose and validate actions concurrently
+        # Compose and validate actions
         async def compose_candidate(cand: CandidateTrigger) -> Optional[Dict[str, Any]]:
             try:
                 res = await self.composer.compose(cand)
@@ -809,14 +1131,24 @@ class DecisionEngine:
                     return fallback
             return None
 
-        tasks = [compose_candidate(cand) for cand in top_candidates]
-        composed_actions = await asyncio.gather(*tasks, return_exceptions=False)
+        async def process_candidate(cand: CandidateTrigger) -> Optional[Dict[str, Any]]:
+            try:
+                action = await compose_candidate(cand)
+                if action and isinstance(action, dict):
+                    # Commit suppression, cooldown, and conversation state
+                    await state.commit_action(action, now_dt)
+                    return action
+                else:
+                    if hasattr(state, "release_reservation"):
+                        await state.release_reservation(cand.merchant_id, cand.suppression_key)
+                    return None
+            except Exception:
+                if hasattr(state, "release_reservation"):
+                    await state.release_reservation(cand.merchant_id, cand.suppression_key)
+                return None
 
-        actions: List[Dict[str, Any]] = []
-        for action in composed_actions:
-            if action and isinstance(action, dict):
-                actions.append(action)
-                # Commit suppression, cooldown, and conversation state
-                await state.commit_action(action, now_dt)
+        tasks = [process_candidate(cand) for cand in candidates_to_compose]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
+        actions: List[Dict[str, Any]] = [a for a in results if a and isinstance(a, dict)]
         return actions

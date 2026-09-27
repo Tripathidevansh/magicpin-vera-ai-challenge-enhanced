@@ -50,6 +50,15 @@ def test_opt_out_detector():
         "stop.",
         "band karo",
         "message mat karo",
+        "Bas theek nahi laga 😐 ab stop karo please, bahut ho gaya.",
+        "stop karo",
+        "ab stop karo",
+        "mat bhejo",
+        "bahut ho gaya",
+        "nahi chahiye",
+        "please stop",
+        "stop please",
+        "khatam karo",
     ]
     for msg in positives:
         assert is_opt_out_or_hostile(msg), f"Expected '{msg}' to be detected as opt-out"
@@ -118,6 +127,11 @@ def test_commitment_detector():
         "not ok, price is high",
         "not sure about this",
         "no",
+        "Yes but not right now, maybe later.",
+        "not right now",
+        "maybe later",
+        "some other time",
+        "baad mein",
     ]
     for msg in negatives:
         assert not is_commitment(msg), f"Expected '{msg}' NOT to be detected as commitment"
@@ -324,11 +338,47 @@ async def test_case_4_negative_feedback_not_opt_out():
     assert conv.state == ConversationState.ENGAGED
 
 
+async def test_case_5_deferral_handling():
+    """
+    TEST 5: Merchant says 'Yes but not right now, maybe later.'
+    -> WAITING state with action='wait' -> does NOT switch to COMMITTED/action mode.
+    """
+    state = ThreadSafeState()
+    conv_id = "conv_deferral_test"
+    mid = "mer_deferral_1"
+
+    now_dt = datetime(2026, 4, 26, 10, 0, tzinfo=timezone.utc)
+    action = {
+        "conversation_id": conv_id,
+        "merchant_id": mid,
+        "trigger_id": "trig_test_5",
+        "body": "Special weekend promotion proposal.",
+    }
+    await state.commit_action(action, now_dt)
+
+    res = await ReplyStateMachine.handle_reply(
+        conversation_id=conv_id,
+        merchant_id=mid,
+        customer_id=None,
+        from_role="merchant",
+        message="Yes but not right now, maybe later.",
+        turn_number=2,
+        state=state,
+    )
+
+    assert res["action"] == "wait"
+    assert res.get("wait_seconds") == 14400
+    assert "deferred or asked for time" in res["rationale"]
+    conv = await state.get_conversation(conv_id)
+    assert conv.state == ConversationState.WAITING
+
+
 if __name__ == "__main__":
     asyncio.run(test_case_1_auto_reply_termination())
     asyncio.run(test_case_2_commitment_and_grounded_next_step())
     asyncio.run(test_case_3_hostile_opt_out_and_suppression())
     asyncio.run(test_case_4_negative_feedback_not_opt_out())
+    asyncio.run(test_case_5_deferral_handling())
     test_opt_out_detector()
     test_auto_reply_detector()
     test_commitment_detector()

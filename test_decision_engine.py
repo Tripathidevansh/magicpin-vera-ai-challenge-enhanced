@@ -401,5 +401,293 @@ class TestDecisionEngine(unittest.IsolatedAsyncioTestCase):
         actions = await self.engine.evaluate_triggers(["trg_adaptive_unseen"], self.now_iso, self.state)
         self.assertEqual(len(actions), 1, "Unseen adaptive fields must not crash the bot")
 
+    # -----------------------------------------------------------------------
+    # N. Unrelated numeric/string field cannot authorize a price
+    # -----------------------------------------------------------------------
+    def test_n_unrelated_numeric_field_cannot_authorize_price(self):
+        cat_no_offer = {"slug": "gyms", "display_name": "Gyms", "voice": {}, "offer_catalog": []}
+        mer_no_offer = {"merchant_id": "m_test_gym", "category_slug": "gyms", "identity": {"name": "Test Gym"}, "offers": []}
+
+        # Case 1: Trigger payload with integer field (days_remaining: 299)
+        trg_int = {"payload": {"days_remaining": 299}}
+        bad_body1 = "Join Test Gym today for only ₹299! Reply YES to claim."
+        is_valid1, reason1 = GroundingValidator.validate(
+            body=bad_body1,
+            category=cat_no_offer,
+            merchant=mer_no_offer,
+            trigger=trg_int,
+            customer=None,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid1, "Arbitrary integer field 'days_remaining: 299' must NOT authorize ₹299")
+        self.assertIn("unverified_price", reason1)
+
+        # Case 2: Trigger payload with string field (days_remaining: "299")
+        trg_str = {"payload": {"days_remaining": "299"}}
+        bad_body2 = "Join Test Gym today for only ₹299! Reply YES to claim."
+        is_valid2, reason2 = GroundingValidator.validate(
+            body=bad_body2,
+            category=cat_no_offer,
+            merchant=mer_no_offer,
+            trigger=trg_str,
+            customer=None,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid2, "Arbitrary string field 'days_remaining: \"299\"' must NOT authorize ₹299")
+        self.assertIn("unverified_price", reason2)
+
+        # Case 3: Genuine price field as integer (renewal_amount: 299) MUST authorize ₹299
+        trg_price_int = {"payload": {"renewal_amount": 299}}
+        good_body1 = "Renew your Test Gym membership today for ₹299. Reply YES to confirm."
+        is_valid3, reason3 = GroundingValidator.validate(
+            body=good_body1,
+            category=cat_no_offer,
+            merchant=mer_no_offer,
+            trigger=trg_price_int,
+            customer=None,
+            cta="binary_yes_no",
+        )
+        self.assertTrue(is_valid3, f"Genuine price field 'renewal_amount: 299' should authorize ₹299, got: {reason3}")
+
+        # Case 4: Genuine price field as string (renewal_amount: "299") MUST authorize ₹299
+        trg_price_str = {"payload": {"renewal_amount": "299"}}
+        good_body2 = "Renew your Test Gym membership today for ₹299. Reply YES to confirm."
+        is_valid4, reason4 = GroundingValidator.validate(
+            body=good_body2,
+            category=cat_no_offer,
+            merchant=mer_no_offer,
+            trigger=trg_price_str,
+            customer=None,
+            cta="binary_yes_no",
+        )
+        self.assertTrue(is_valid4, f"Genuine price field 'renewal_amount: \"299\"' should authorize ₹299, got: {reason4}")
+
+    # -----------------------------------------------------------------------
+    # O. Pharmacy slug activates medical-claim protection
+    # -----------------------------------------------------------------------
+    def test_o_pharmacy_slug_activates_medical_claim_protection(self):
+        cat_pharmacy = {
+            "slug": "pharmacies",
+            "display_name": "Pharmacies",
+            "voice": {"vocab_taboo": []},
+            "offer_catalog": [],
+        }
+        mer_pharmacy = {
+            "merchant_id": "m_test_pharmacy",
+            "category_slug": "pharmacies",
+            "identity": {"name": "Test Pharmacy"},
+            "offers": [],
+        }
+        trg = {"payload": {}}
+
+        # Message with medical taboo for pharmacy category
+        bad_med_body = "Namaste — try our herbal cough syrup for a 100% cure with zero risk. Reply YES."
+        is_valid, reason = GroundingValidator.validate(
+            body=bad_med_body,
+            category=cat_pharmacy,
+            merchant=mer_pharmacy,
+            trigger=trg,
+            customer=None,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid, "Medical claim must be rejected when category slug is 'pharmacies'")
+        self.assertIn("contains_medical_claim", reason)
+
+    # -----------------------------------------------------------------------
+    # P. Unsupported date claim is rejected (provenance-oriented)
+    # -----------------------------------------------------------------------
+    def test_p_unsupported_date_claim_is_rejected(self):
+        # 1. Unverified date in context without 2026-05-20
+        bad_date_body = "Hi Priya, Dr. Meera has an open slot on 2026-05-20. Reply YES to book."
+        is_valid, reason = GroundingValidator.validate(
+            body=bad_date_body,
+            category=self.cat_dentist,
+            merchant=self.mer_meera,
+            trigger={"payload": {}},
+            customer=self.cust_priya,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid, "Unsupported calendar date '2026-05-20' must be rejected")
+        self.assertIn("unsupported_date", reason)
+
+        # 2. Date mentioned only in arbitrary text/comment field must NOT authorize the date
+        trg_arbitrary_text_date = {"payload": {"doctor_note": "Patient mentioned last visited 2026-05-20 for consultation"}}
+        is_valid_arb, reason_arb = GroundingValidator.validate(
+            body=bad_date_body,
+            category=self.cat_dentist,
+            merchant=self.mer_meera,
+            trigger=trg_arbitrary_text_date,
+            customer=self.cust_priya,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid_arb, "Arbitrary text field with date must NOT authorize an appointment slot date")
+        self.assertIn("unsupported_date", reason_arb)
+
+        # 3. Grounded slot date (Wed 5 Nov) present in trigger available_slots must pass
+        trg_with_slot = {
+            "payload": {
+                "available_slots": [
+                    {"iso": "2026-11-05T18:00:00+05:30", "label": "Wed 5 Nov, 6pm"},
+                    {"iso": "2026-11-06T17:00:00+05:30", "label": "Thu 6 Nov, 5pm"},
+                ]
+            }
+        }
+        good_date_body = "Hi Priya, 2 slots ready: Wed 5 Nov, 6pm ya Thu 6 Nov, 5pm. Reply 1 for Wed, 2 for Thu, or tell us a time."
+        is_valid2, reason2 = GroundingValidator.validate(
+            body=good_date_body,
+            category=self.cat_dentist,
+            merchant=self.mer_meera,
+            trigger=trg_with_slot,
+            customer=self.cust_priya,
+            cta="multi_choice_slot",
+        )
+        self.assertTrue(is_valid2, f"Verified slot dates should pass, got: {reason2}")
+
+    # -----------------------------------------------------------------------
+    # Q. Unsupported operational/delivery claim is rejected (provenance-oriented)
+    # -----------------------------------------------------------------------
+    def test_q_unsupported_operational_claim_is_rejected(self):
+        cat_general = {"slug": "retail", "voice": {"vocab_taboo": []}, "offer_catalog": []}
+        mer_general = {"merchant_id": "m_test_retail", "category_slug": "retail", "identity": {"name": "Test Store"}, "offers": []}
+
+        # 1. Operational commitment without verified offer or policy
+        bad_op_body = "Hi Priya, we promise instant delivery for all orders. Reply YES."
+        is_valid, reason = GroundingValidator.validate(
+            body=bad_op_body,
+            category=cat_general,
+            merchant=mer_general,
+            trigger={"payload": {}},
+            customer=self.cust_priya,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid, "Unsupported operational commitment 'promise instant delivery' must be rejected")
+        self.assertTrue(
+            "unsupported_operational_commitment" in reason or "unsupported_delivery_claim" in reason,
+            f"Expected operational rejection, got: {reason}",
+        )
+
+        # 2. Free delivery claim when only random review mentions delivery
+        mer_with_review = {
+            "merchant_id": "m_test_retail2",
+            "category_slug": "retail",
+            "identity": {"name": "Test Store"},
+            "offers": [],
+            "reviews": [{"comment": "delivery took 2 hours"}],  # Mere substring in reviews!
+        }
+        bad_deliv_body = "Hi Priya, we offer free home delivery on all orders. Reply YES to order."
+        is_valid_deliv, reason_deliv = GroundingValidator.validate(
+            body=bad_deliv_body,
+            category=cat_general,
+            merchant=mer_with_review,
+            trigger={"payload": {}},
+            customer=self.cust_priya,
+            cta="binary_yes_no",
+        )
+        self.assertFalse(is_valid_deliv, "Mere mention of delivery in reviews must NOT authorize free home delivery claim")
+        self.assertIn("unsupported_delivery_claim", reason_deliv)
+
+        # 3. Explicit verified offer for free home delivery MUST authorize the claim
+        mer_with_offer = {
+            "merchant_id": "m_test_retail3",
+            "category_slug": "retail",
+            "identity": {"name": "Test Store"},
+            "offers": [{"id": "o_deliv_01", "title": "Free Home Delivery > ₹499", "status": "active"}],
+        }
+        good_deliv_body = "Hi Priya, Free home delivery available on orders over ₹499. Reply YES to order."
+        is_valid_deliv2, reason_deliv2 = GroundingValidator.validate(
+            body=good_deliv_body,
+            category=cat_general,
+            merchant=mer_with_offer,
+            trigger={"payload": {}},
+            customer=self.cust_priya,
+            cta="binary_yes_no",
+        )
+        self.assertTrue(is_valid_deliv2, f"Verified delivery offer should authorize delivery claim, got: {reason_deliv2}")
+
+    # -----------------------------------------------------------------------
+    # R. Concurrent identical tick calls produce at most one action
+    # -----------------------------------------------------------------------
+    async def test_r_concurrent_identical_ticks_produce_at_most_one_action(self):
+        trg_concurrent = {
+            "id": "trg_concurrent_race",
+            "scope": "merchant",
+            "kind": "research_digest",
+            "merchant_id": "m_001_drmeera",
+            "urgency": 5,
+            "suppression_key": "supp:concurrent_race",
+            "expires_at": "2026-05-10T00:00:00Z",
+            "payload": {"category": "dentists", "top_item_id": "d_001_fluoride"},
+        }
+        await self.state.put_context("trigger", "trg_concurrent_race", 1, trg_concurrent, self.now_iso)
+
+        # Launch two identical evaluate_triggers calls concurrently
+        task1 = self.engine.evaluate_triggers(["trg_concurrent_race"], self.now_iso, self.state)
+        task2 = self.engine.evaluate_triggers(["trg_concurrent_race"], self.now_iso, self.state)
+        res1, res2 = await asyncio.gather(task1, task2)
+
+        total_actions = len(res1) + len(res2)
+        self.assertLessEqual(total_actions, 1, f"Expected at most 1 action across concurrent ticks, got {total_actions}")
+        self.assertEqual(total_actions, 1, "Exactly one concurrent tick should claim and commit the action")
+
+        # Verify state remains valid: suppression and cooldown active
+        is_supp = await self.state.is_suppressed("supp:concurrent_race", self.now_dt, merchant_id="m_001_drmeera")
+        is_cooldown = await self.state.is_merchant_in_cooldown("m_001_drmeera", self.now_dt)
+        self.assertTrue(is_supp, "Suppression must be active after commit")
+        self.assertTrue(is_cooldown, "Merchant cooldown must be active after commit")
+
+        # A subsequent tick must be suppressed
+        tick3_now = (self.now_dt + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        res3 = await self.engine.evaluate_triggers(["trg_concurrent_race"], tick3_now, self.state)
+        self.assertEqual(len(res3), 0, "Subsequent tick must be suppressed")
+
+    # -----------------------------------------------------------------------
+    # S. Different merchants + same suppression key can both proceed concurrently
+    # -----------------------------------------------------------------------
+    async def test_s_concurrent_different_merchants_same_suppression_key_both_proceed(self):
+        # Register second merchant (Dr. Bharat)
+        mer_bharat = {
+            "merchant_id": "m_002_bharat",
+            "category_slug": "dentists",
+            "identity": {"name": "Bharat Dental Care", "owner_first_name": "Bharat", "locality": "Bandra"},
+            "offers": [],
+        }
+        await self.state.put_context("merchant", "m_002_bharat", 1, mer_bharat, self.now_iso)
+
+        # Trigger for Merchant A and Trigger for Merchant B sharing the SAME suppression key
+        shared_supp_key = "research:dentists:shared_week_17"
+        trg_a = {
+            "id": "trg_shared_mer_a",
+            "scope": "merchant",
+            "kind": "research_digest",
+            "merchant_id": "m_001_drmeera",
+            "urgency": 4,
+            "suppression_key": shared_supp_key,
+            "expires_at": "2026-05-10T00:00:00Z",
+            "payload": {"category": "dentists", "top_item_id": "d_001_fluoride"},
+        }
+        trg_b = {
+            "id": "trg_shared_mer_b",
+            "scope": "merchant",
+            "kind": "research_digest",
+            "merchant_id": "m_002_bharat",
+            "urgency": 4,
+            "suppression_key": shared_supp_key,
+            "expires_at": "2026-05-10T00:00:00Z",
+            "payload": {"category": "dentists", "top_item_id": "d_001_fluoride"},
+        }
+        await self.state.put_context("trigger", "trg_shared_mer_a", 1, trg_a, self.now_iso)
+        await self.state.put_context("trigger", "trg_shared_mer_b", 1, trg_b, self.now_iso)
+
+        # Concurrently evaluate triggers for Merchant A and Merchant B
+        task_a = self.engine.evaluate_triggers(["trg_shared_mer_a"], self.now_iso, self.state)
+        task_b = self.engine.evaluate_triggers(["trg_shared_mer_b"], self.now_iso, self.state)
+        res_a, res_b = await asyncio.gather(task_a, task_b)
+
+        self.assertEqual(len(res_a), 1, "Merchant A must produce an action")
+        self.assertEqual(len(res_b), 1, "Merchant B must also produce an action despite shared suppression key")
+        self.assertEqual(res_a[0]["merchant_id"], "m_001_drmeera")
+        self.assertEqual(res_b[0]["merchant_id"], "m_002_bharat")
+
 if __name__ == "__main__":
     unittest.main()
+
